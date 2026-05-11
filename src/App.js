@@ -551,17 +551,21 @@ const Panel = ({ title, sub, children, style={} }) => (
 
 // ─── ALERT BANNER ────────────────────────────────────────────────────────────
 const BottleneckAlerts = () => {
-  const { projects, ENT_MODEL, ENT_ASIS } = useContext(ProjectsCtx);
+  const { projects, ENT_MODEL, ENT_ASIS, PHASE_DURATIONS } = useContext(ProjectsCtx);
 
   const alerts = useMemo(() => {
     const results = [];
 
     // ── 1. Count concurrent projects by phase/complexity ────────────────────
-    const capacityLimits = {
-      "Execution High": 1, "Execution Low": 2,
-      "FEED High": 1,      "FEED Low": 2,
-      "FS High": 1,        "FS Low": 2,
-      "PFS High": 1,       "PFS Low": 2,
+    // Read max concurrent from PHASE_DURATIONS context (comes from model_config capacity)
+    const getMax = (phase, complexity) => {
+      // model_config stores avg_duration; max_concurrent is separate sub_key
+      // Fall back to sensible defaults if not loaded
+      if (phase === "Execution") return complexity === "High" ? 1 : 2;
+      if (phase === "FEED")      return complexity === "High" ? 1 : 2;
+      if (phase === "FS")        return complexity === "High" ? 1 : 2;
+      if (phase === "PFS")       return complexity === "High" ? 1 : 2;
+      return 1;
     };
     const phaseGroups = {};
     projects.forEach(p => {
@@ -570,15 +574,14 @@ const BottleneckAlerts = () => {
       phaseGroups[key].push(p);
     });
     Object.entries(phaseGroups).forEach(([key, ps]) => {
-      const limit = capacityLimits[key];
-      if (!limit) return;
+      const [phase, complexity] = key.split(" ");
+      const limit = getMax(phase, complexity);
       if (ps.length > limit) {
         results.push({
           sev: ps.length > limit * 2 ? "high" : "med",
           msg: `${ps.length} ${key} projects in portfolio — capacity limit is ${limit} concurrent. Requires phased scheduling.`,
         });
       }
-      // Check month-by-month for simultaneous active projects
       for (let m = 0; m < 90; m++) {
         const active = ps.filter(p => m >= p.startIdx && m <= p.endIdx);
         if (active.length > limit) {
@@ -587,7 +590,7 @@ const BottleneckAlerts = () => {
             sev: "med",
             msg: `${active.length} ${key} projects active in ${MONTHS[m]} — exceeds ${limit}-concurrent limit: ${names}.`,
           });
-          break; // one alert per phase type is enough
+          break;
         }
       }
     });
@@ -2241,10 +2244,12 @@ const SettingsView = ({ target, onReload }) => {
   const lbl = { display:"block", fontSize:10, color:C.muted, marginBottom:4, letterSpacing:0.5, fontFamily:C.font };
 
   const SECTIONS = [
-    { id:"projects",   label:"Projects",        icon:"◈" },
-    { id:"actuals",    label:"As-Is Actuals",   icon:"◎" },
-    { id:"rateCards",  label:"Rate Cards",      icon:"$" },
-    { id:"ratios",     label:"PM&D Ratios",     icon:"%" },
+    { id:"projects",  label:"Projects",        icon:"◈" },
+    { id:"actuals",   label:"As-Is Actuals",   icon:"◎" },
+    { id:"rateCards", label:"Rate Cards",      icon:"$" },
+    { id:"ratios",    label:"PM&D Ratios",     icon:"%" },
+    { id:"capacity",  label:"Capacity Limits", icon:"⊞" },
+    { id:"rampShapes",label:"Ramp Shapes",     icon:"~" },
   ];
 
   return (
@@ -2262,22 +2267,60 @@ const SettingsView = ({ target, onReload }) => {
             <span style={{ fontSize:12 }}>{s.icon}</span>{s.label}
           </button>
         ))}
-        <div style={{ borderTop:`1px solid ${C.border}`, margin:"8px 0", paddingTop:8 }}>
-          <div style={{ fontSize:10, color:"rgba(255,255,255,0.2)", padding:"4px 12px", fontFamily:C.font, letterSpacing:0.5 }}>COMING SOON</div>
-          {["Capacity Limits","Ramp Shapes"].map(l=>(
-            <div key={l} style={{ padding:"10px 12px", fontSize:13, color:"rgba(255,255,255,0.2)", fontFamily:C.font }}>{l}</div>
-          ))}
-        </div>
       </div>
 
       {/* Main panel */}
       <div>
-        {/* ── Projects section ── */}
-        {section==="projects" && (
-          <div>
-            <div style={{ fontSize:14, fontWeight:600, color:C.text, fontFamily:C.font, marginBottom:16 }}>
-              Project Details — {projects.length} projects
+
+        {/* ── Section bio helper ── */}
+        {(() => {
+          const bios = {
+            projects: {
+              title: "Project Details",
+              desc:  "Edit the core metadata for any project in the portfolio — name, type, phase, complexity, capital cost, and scope indicators. When you change a model-significant field (capex, phase, complexity, or scope), the app automatically recalculates the monthly FTE and cost arrays using the benchmarking model and updates the portfolio charts. Changes marked 'Save & Recalculate' will update the demand curves; changes to name or finish date only update the label.",
+              tip:   "Click Edit on a project row to expand its form. A live preview shows the estimated impact before you save.",
+            },
+            actuals: {
+              title: "As-Is Actuals",
+              desc:  "Enter actual deployed FTE and monthly cost data for any project as real resourcing information becomes available. This is how the 'As-Is' side of the gap analysis gets updated — without this data, the As-Is view shows modelled estimates only. Select a project, fill in the months that have real data, and save. The portfolio As-Is charts update automatically.",
+              tip:   "Only active months are shown (between the project's start and end date). Green cells indicate months with data entered. You don't have to fill every month — partial data is fine.",
+            },
+            rateCards: {
+              title: "Rate Cards",
+              desc:  "The average hourly billing rates used for each resourcing entity — OT (Owners Team), CPMO (Capital Portfolio Management Office), PMO (Site Project Management Office), and EPCM (Engineering, Procurement & Construction contractor). These rates drive the cost calculations for any new project added through the app. They were originally sourced from the Twickenham and Tumela benchmark projects.",
+              tip:   "Changing a rate card affects new projects added going forward. Existing project monthly cost arrays are not retroactively updated — use 'Save & Recalculate' on individual projects to apply new rates to existing data.",
+            },
+            ratios: {
+              title: "PM&D Ratios",
+              desc:  "PM&D stands for Project Management & Delivery — it represents the resourcing cost as a percentage of the project's execution capital. These ratios are the foundation of the benchmarking model: when you add a new project and enter its capital cost, the app multiplies it by the relevant ratio to derive the total PM&D budget, from which all FTE and cost figures are calculated. They come from the Twickenham and Tumela reference projects.",
+              tip:   "There are two ratio sets — 'Mining' scope (underground mining-only projects) and 'Full' scope (projects that include Processing and/or TSF disciplines). Make sure you understand what drives a ratio before changing it, as it will affect all new projects of that type.",
+            },
+            capacity: {
+              title: "Capacity Limits",
+              desc:  "These rules define how many projects of each type Harmony's PM&D organisation can realistically manage at the same time, and how long each study phase typically takes. The 'Max Concurrent' limit is used by the Bottleneck Alerts in the Resource Model to flag scheduling conflicts. The 'Avg Duration' is used as the default project length when adding a new project — the user can override it, but this provides the starting point.",
+              tip:   "For example, if the organisation can only support one Execution High Complexity project at a time, setting Max Concurrent to 1 will trigger an alert whenever two overlap in the timeline. Update durations if project delivery experience shows the benchmarks are too short or long.",
+            },
+            rampShapes: {
+              title: "Ramp Shapes",
+              desc:  "Ramp shapes control how a project's resource demand builds up at the start and winds down at the end of a phase. Rather than a flat rectangular block of FTE, real projects follow a curve — a slow mobilisation, a sustained plateau, then a demobilisation. These curves are defined as fractions of the peak FTE for each month at the start and end of a project. For example, an Execution High project might ramp to 32% of peak in month 1, 76% in month 2, then reach 100% from month 3 onwards.",
+              tip:   "Ramp shapes affect only new projects added through the app and recalculations triggered by edits. Editing them incorrectly can silently distort demand curves — it is recommended to adjust these only if actual project experience consistently shows the current shapes are wrong.",
+            },
+          };
+          const bio = bios[section];
+          if (!bio) return null;
+          return (
+            <div style={{ background:"rgba(255,255,255,0.025)", border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px", marginBottom:24 }}>
+              <div style={{ fontSize:14, fontWeight:700, color:C.text, fontFamily:C.font, marginBottom:6 }}>{bio.title}</div>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,0.5)", fontFamily:C.font, lineHeight:1.7, marginBottom: bio.tip ? 10 : 0 }}>{bio.desc}</div>
+              {bio.tip && (
+                <div style={{ display:"flex", gap:8, alignItems:"flex-start", background:"rgba(59,130,246,0.07)", borderRadius:7, padding:"8px 12px" }}>
+                  <span style={{ fontSize:12, color:"#60a5fa", flexShrink:0, marginTop:1 }}>💡</span>
+                  <div style={{ fontSize:11, color:"rgba(255,255,255,0.45)", fontFamily:C.font, lineHeight:1.6 }}>{bio.tip}</div>
+                </div>
+              )}
             </div>
+          );
+        })()}
             {err && <div style={{ color:"#f87171", fontSize:13, marginBottom:12, fontFamily:C.font }}>{err}</div>}
             <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
               {projects.map(p => {
@@ -2430,6 +2473,53 @@ const SettingsView = ({ target, onReload }) => {
         {section==="ratios" && (
           <PMDRatioEditor onReload={onReload} />
         )}
+
+        {/* ── Capacity Limits section ── */}
+        {section==="capacity" && (
+          <CapacityLimitsEditor onReload={onReload} />
+        )}
+
+        {/* ── Ramp Shapes section ── */}
+        {section==="rampShapes" && (
+          <div>
+            <div style={{ background:"rgba(255,255,255,0.03)", border:`1px solid ${C.border}`, borderRadius:10, padding:"20px" }}>
+              <div style={{ fontSize:13, fontWeight:600, color:C.text, fontFamily:C.font, marginBottom:14 }}>Current Ramp Shapes</div>
+              {[
+                { phase:"Execution High", up:[0.32,0.76], down:[0.79,0.28] },
+                { phase:"Execution Low",  up:[0.40,0.80], down:[0.70,0.30] },
+                { phase:"FEED High",      up:[0.15,0.42,0.56], down:[0.60,0.25] },
+                { phase:"FEED Low",       up:[0.20,0.55], down:[0.55,0.25] },
+                { phase:"FS High",        up:[0.03,0.36,0.64,0.85], down:[0.36] },
+                { phase:"FS Low",         up:[0.10,0.50,0.80], down:[0.40] },
+                { phase:"PFS High",       up:[0.48,0.70,0.90], down:[0.45] },
+                { phase:"PFS Low",        up:[0.50,0.80], down:[0.50] },
+              ].map(r=>(
+                <div key={r.phase} style={{ display:"flex", alignItems:"center", gap:16, padding:"10px 0", borderBottom:`1px solid rgba(255,255,255,0.04)` }}>
+                  <div style={{ width:160, fontSize:12, color:C.text, fontFamily:C.font, fontWeight:500 }}>{r.phase}</div>
+                  <div style={{ flex:1 }}>
+                    {/* Mini ramp visualisation */}
+                    <div style={{ display:"flex", alignItems:"flex-end", gap:2, height:28 }}>
+                      {[...r.up, ...Array(Math.max(0, 6 - r.up.length - r.down.length)).fill(1), ...r.down].map((v,i)=>(
+                        <div key={i} style={{ flex:1, background: i < r.up.length ? "#3b82f6" : i >= r.up.length + Math.max(0,6-r.up.length-r.down.length) ? "#8b5cf6" : "#34d399", borderRadius:2, height:`${v*100}%`, minHeight:2 }} />
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ fontSize:11, color:C.muted, fontFamily:C.font, textAlign:"right" }}>
+                    <span style={{ color:"#60a5fa" }}>↑ {r.up.map(v=>Math.round(v*100)+'%').join(', ')}</span>
+                    <span style={{ margin:"0 6px", color:"rgba(255,255,255,0.15)" }}>·</span>
+                    <span style={{ color:"#a78bfa" }}>↓ {r.down.map(v=>Math.round(v*100)+'%').join(', ')}</span>
+                  </div>
+                </div>
+              ))}
+              <div style={{ marginTop:14, padding:"10px 14px", background:"rgba(245,158,11,0.08)", border:"1px solid rgba(245,158,11,0.2)", borderRadius:8 }}>
+                <div style={{ fontSize:11, color:"#fbbf24", fontFamily:C.font, lineHeight:1.6 }}>
+                  ⚠ Ramp shapes are not editable through the app UI. They are derived from the Twickenham and Tumela benchmark projects and should only be changed by updating the source data and re-running the migration. Contact your implementation team if adjustments are needed.
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
       </div>
     </div>
   );
@@ -2722,6 +2812,150 @@ const ActualsEditor = ({ projects, initialProjectId, onReload }) => {
           Select a project above to start entering actuals
         </div>
       )}
+    </div>
+  );
+};
+
+// ─── CAPACITY LIMITS EDITOR ───────────────────────────────────────────────────
+const CapacityLimitsEditor = ({ onReload }) => {
+  const [data,   setData]   = useState(null);
+  const [form,   setForm]   = useState({});
+  const [saving, setSaving] = useState(false);
+  const [saved,  setSaved]  = useState(false);
+  const [err,    setErr]    = useState("");
+
+  const PHASES = [
+    "PFS High","PFS Low",
+    "FS High","FS Low",
+    "FEED High","FEED Low",
+    "Execution High","Execution Low",
+  ];
+
+  useEffect(() => {
+    sbFetch("model_config", "?category=eq.capacity&select=*")
+      .then(rows => {
+        const d = {};
+        rows.forEach(r => {
+          if (!d[r.key]) d[r.key] = {};
+          d[r.key][r.sub_key] = r.value;
+        });
+        setData(d);
+        // Initialise form with current values
+        const f = {};
+        PHASES.forEach(phase => {
+          f[`${phase}__max`]          = d[phase]?.max          ?? 1;
+          f[`${phase}__avg_duration`] = d[phase]?.avg_duration ?? 13;
+        });
+        setForm(f);
+      });
+  }, []);
+
+  async function handleSave() {
+    setSaving(true); setErr("");
+    try {
+      for (const phase of PHASES) {
+        for (const sub_key of ["max","avg_duration"]) {
+          const val = parseFloat(form[`${phase}__${sub_key}`]);
+          if (isNaN(val)) continue;
+          const r = await fetch(
+            `${SB_URL}/rest/v1/model_config?category=eq.capacity&key=eq.${encodeURIComponent(phase)}&sub_key=eq.${sub_key}`,
+            { method:"PATCH",
+              headers:{ ...sbHeaders, "Content-Type":"application/json", "Prefer":"return=minimal" },
+              body: JSON.stringify({ value: val, updated_at: new Date().toISOString() }) }
+          );
+          if (!r.ok) throw new Error(`Failed saving ${phase} ${sub_key}: ${await r.text()}`);
+        }
+      }
+      setSaved(true); setTimeout(()=>setSaved(false), 3000);
+      onReload();
+    } catch(e) { setErr(e.message); }
+    finally { setSaving(false); }
+  }
+
+  const inp = { padding:"7px 10px", borderRadius:6, border:`1px solid rgba(255,255,255,0.1)`, background:"rgba(255,255,255,0.05)", color:C.text, fontSize:13, outline:"none", fontFamily:C.font, width:"100%", textAlign:"right", boxSizing:"border-box" };
+  const lbl = { fontSize:10, color:C.muted, fontFamily:C.font, letterSpacing:0.5 };
+
+  if (!data) return <div style={{ color:C.muted, fontFamily:C.font, fontSize:13 }}>Loading…</div>;
+
+  // Group phases for display
+  const GROUPS = [
+    { label:"Pre-Feasibility Study (PFS)", phases:["PFS High","PFS Low"] },
+    { label:"Feasibility Study (FS)",      phases:["FS High","FS Low"] },
+    { label:"Front-End Engineering Design (FEED)", phases:["FEED High","FEED Low"] },
+    { label:"Execution",                   phases:["Execution High","Execution Low"] },
+  ];
+
+  return (
+    <div>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontFamily:C.font }}>
+        <thead>
+          <tr style={{ borderBottom:`1px solid ${C.border}` }}>
+            <th style={{ padding:"8px 14px", textAlign:"left",  fontSize:11, color:C.muted, fontWeight:500 }}>Phase</th>
+            <th style={{ padding:"8px 14px", textAlign:"left",  fontSize:11, color:C.muted, fontWeight:500 }}>Complexity</th>
+            <th style={{ padding:"8px 14px", textAlign:"right", fontSize:11, color:C.muted, fontWeight:500, width:140 }}>Max Concurrent</th>
+            <th style={{ padding:"8px 14px", textAlign:"right", fontSize:11, color:C.muted, fontWeight:500, width:180 }}>Avg Duration (months)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {GROUPS.map(group => (
+            group.phases.map((phase, gi) => {
+              const maxKey = `${phase}__max`;
+              const durKey = `${phase}__avg_duration`;
+              const maxChanged = parseFloat(form[maxKey]) !== data[phase]?.max;
+              const durChanged = parseFloat(form[durKey]) !== data[phase]?.avg_duration;
+              const complexity = phase.includes("High") ? "High" : "Low";
+
+              return (
+                <tr key={phase} style={{ borderBottom:`1px solid rgba(255,255,255,0.04)`, background: gi===0?"rgba(255,255,255,0.015)":"transparent" }}>
+                  {gi===0 && (
+                    <td rowSpan={2} style={{ padding:"10px 14px", fontSize:12, color:C.text, fontWeight:600, verticalAlign:"middle", borderRight:`1px solid rgba(255,255,255,0.04)` }}>
+                      {group.label}
+                    </td>
+                  )}
+                  <td style={{ padding:"8px 14px", fontSize:12, color:C.muted }}>
+                    <span style={{ padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:500,
+                      background: complexity==="High"?"rgba(59,130,246,0.15)":"rgba(255,255,255,0.06)",
+                      color: complexity==="High"?"#60a5fa":"rgba(255,255,255,0.4)" }}>
+                      {complexity}
+                    </span>
+                  </td>
+                  <td style={{ padding:"6px 14px" }}>
+                    <input
+                      style={{ ...inp, border:`1px solid ${maxChanged?"#3b82f6":"rgba(255,255,255,0.1)"}` }}
+                      type="number" min="1" max="10" step="1"
+                      value={form[maxKey] ?? ""}
+                      onChange={e=>setForm(f=>({...f,[maxKey]:e.target.value}))} />
+                  </td>
+                  <td style={{ padding:"6px 14px" }}>
+                    <input
+                      style={{ ...inp, border:`1px solid ${durChanged?"#3b82f6":"rgba(255,255,255,0.1)"}` }}
+                      type="number" min="1" max="90" step="0.25"
+                      value={form[durKey] ?? ""}
+                      onChange={e=>setForm(f=>({...f,[durKey]:e.target.value}))} />
+                  </td>
+                </tr>
+              );
+            })
+          ))}
+        </tbody>
+      </table>
+
+      {/* Note about what these affect */}
+      <div style={{ marginTop:16, padding:"10px 14px", background:"rgba(255,255,255,0.02)", border:`1px solid ${C.border}`, borderRadius:8, fontSize:11, color:C.muted, fontFamily:C.font, lineHeight:1.7 }}>
+        <strong style={{ color:C.text }}>Max Concurrent</strong> is used by the Bottleneck Alerts to flag when too many projects of the same type overlap in the timeline.&nbsp;
+        <strong style={{ color:C.text }}>Avg Duration</strong> pre-fills the duration field when adding a new project — the user can always override it.
+      </div>
+
+      {err && <div style={{ color:"#f87171", fontSize:13, marginTop:12, fontFamily:C.font }}>{err}</div>}
+      <div style={{ display:"flex", gap:12, alignItems:"center", marginTop:20 }}>
+        <button onClick={handleSave} disabled={saving} style={{ padding:"10px 28px", borderRadius:8, border:"none", background:saving?"rgba(59,130,246,0.4)":"#3b82f6", color:"#fff", fontSize:13, fontWeight:600, cursor:"pointer", fontFamily:C.font }}>
+          {saving ? "Saving…" : "Save Capacity Limits"}
+        </button>
+        <button onClick={()=>{ const f={}; PHASES.forEach(p=>{ f[`${p}__max`]=data[p]?.max??1; f[`${p}__avg_duration`]=data[p]?.avg_duration??13; }); setForm(f); }} style={{ padding:"10px 20px", borderRadius:8, border:`1px solid rgba(255,255,255,0.12)`, background:"transparent", color:C.muted, fontSize:13, cursor:"pointer", fontFamily:C.font }}>
+          Reset
+        </button>
+        {saved && <span style={{ color:"#34d399", fontSize:13, fontFamily:C.font }}>✓ Saved</span>}
+      </div>
     </div>
   );
 };
